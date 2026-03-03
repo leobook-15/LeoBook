@@ -17,3 +17,6 @@ psutil
 # Supabase sync dependencies
 supabase>=2.0.0
 tqdm
+
+# RL dependencies (PyTorch CPU) — install separately:
+#   pip install -r requirements-rl.txt

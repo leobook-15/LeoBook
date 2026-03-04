@@ -491,9 +491,20 @@ async def extract_tab(page: Page, league_url: str, tab: str, conn,
     print(f"    [{tab.upper()}] Navigating to {url}")
 
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        resp = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
         await asyncio.sleep(3)
         await fs_universal_popup_dismissal(page)
+
+        # Detect 404 or redirect (league may not play in this season)
+        if resp and resp.status >= 400:
+            print(f"    [{tab.upper()}] HTTP {resp.status} — season not available")
+            return 0
+        # Flashscore redirects invalid seasons to the main league page
+        actual_url = page.url.rstrip('/')
+        expected_base = url.rstrip('/')
+        if actual_url != expected_base and tab not in actual_url:
+            print(f"    [{tab.upper()}] Redirected (season not available)")
+            return 0
     except Exception as e:
         print(f"    [{tab.upper()}] Navigation failed: {e}")
         return 0
@@ -840,38 +851,57 @@ async def enrich_single_league(context, league: Dict[str, Any], conn,
         total_matches = fixtures_count + results_count
 
         # ── Historical seasons (if requested) ────────────────────────
-        # --season 0 = current only (no archive), --season N = Nth past season only
-        # --seasons N = last N past seasons, --all-seasons = everything
-        need_archive = (
+        # URL construction: {base}/football/{country}/{slug}-{startYear}-{endYear}/
+        # No archive page needed — construct directly from year offset
+        # --season 0 = current only, --season N = offset N past season
+        # --seasons N = last N past seasons, --all-seasons = archive fallback
+        need_past_seasons = (
             (target_season is not None and target_season >= 1) or
             num_seasons > 0 or
             all_seasons
         )
-        if need_archive:
-            archive_seasons = await get_archive_seasons(page, url)
+        if need_past_seasons:
+            # Extract slug and country from league URL
+            # URL: https://www.flashscore.com/football/{country}/{slug}/
+            url_stripped = url.rstrip('/')
+            slug = url_stripped.split('/')[-1]       # e.g. "npfl"
+            country_slug = url_stripped.split('/')[-2]  # e.g. "nigeria"
 
-            if target_season is not None and target_season >= 1:
-                # --season N: pick ONLY the Nth archive season (1=most recent past)
-                if target_season <= len(archive_seasons):
-                    archive_seasons = [archive_seasons[target_season - 1]]
-                    print(f"    [Season Target] Picking season #{target_season}: {archive_seasons[0].get('slug', '')}")
+            from datetime import datetime
+            current_year = datetime.now().year  # e.g. 2026
+
+            if all_seasons:
+                # --all-seasons: fall back to archive page for full discovery
+                archive_seasons = await get_archive_seasons(page, url)
+                season_urls = []
+                for s in archive_seasons:
+                    s_slug = s.get("slug", "")
+                    s_start = s.get("start_year", 0)
+                    s_end = s.get("end_year", 0)
+                    label = f"{s_start}/{s_end}" if s_start != s_end else str(s_start)
+                    s_url = f"https://www.flashscore.com/football/{s.get('country', '')}/{s_slug}/"
+                    season_urls.append((label, s_url))
+            else:
+                # Direct URL construction from year offset
+                season_urls = []
+                if target_season is not None and target_season >= 1:
+                    # --season N: only the Nth past season
+                    offsets = [target_season]
                 else:
-                    print(f"    [Season Target] Season #{target_season} not available (only {len(archive_seasons)} found)")
-                    archive_seasons = []
-            elif num_seasons > 0:
-                # --seasons N: take the last N most recent archive seasons
-                archive_seasons = archive_seasons[:num_seasons]
+                    # --seasons N: last N past seasons (offsets 1..N)
+                    offsets = list(range(1, num_seasons + 1))
 
-            for s_idx, s in enumerate(archive_seasons, 1):
-                s_slug = s.get("slug", "")
-                s_start = s.get("start_year", 0)
-                s_end = s.get("end_year", 0)
-                season_label = f"{s_start}/{s_end}" if s_start != s_end else str(s_start)
+                for offset_n in offsets:
+                    start_yr = current_year - 1 - offset_n  # e.g. offset 1 -> 2024
+                    end_yr = current_year - offset_n        # e.g. offset 1 -> 2025
+                    season_label = f"{start_yr}/{end_yr}"
+                    season_slug = f"{slug}-{start_yr}-{end_yr}"
+                    season_url = f"https://www.flashscore.com/football/{country_slug}/{season_slug}/"
+                    season_urls.append((season_label, season_url))
 
-                print(f"\n    [Season {s_idx}/{len(archive_seasons)}] {season_label} ({s_slug})")
-
-                # Build the season URL base
-                season_base_url = f"https://www.flashscore.com/football/{s.get('country', '')}/{s_slug}/"
+            for s_idx, (season_label, season_base_url) in enumerate(season_urls, 1):
+                print(f"\n    [Season {s_idx}/{len(season_urls)}] {season_label}")
+                print(f"      URL: {season_base_url}")
 
                 # Results tab for historical seasons
                 r_count = await extract_tab(
